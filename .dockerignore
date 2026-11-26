@@ -1,0 +1,12 @@
+*
+!Dockerfile
+!LICENSE
+!prm_release.py
+!rule_changes.py
+!verify_release.py
+!mihomo.py
+!schedule.py
+!origin.py
+!test_release.py
+!nginx.conf
+!public-paths.conf

@@ -1,0 +1,46 @@
+services:
+  prm:
+    image: ghcr.io/fl0w1nd/prm:0.1.4@sha256:81669f76c4aaa502d4e3b44616fb99f7925aa8e2ff25e8dd00c8f50899130a55
+    restart: unless-stopped
+    environment:
+      PRM_ADMIN_TOKEN: ${PRM_ADMIN_TOKEN:?required}
+    volumes:
+      - ${PRM_DATA:?required}:/data
+
+  publisher:
+    image: ${HOME_RULES_IMAGE:?required}
+    restart: unless-stopped
+    init: true
+    user: ${HOME_RULES_USER:?required}
+    read_only: true
+    tmpfs:
+      - /tmp
+    stop_grace_period: 15m
+    depends_on:
+      - prm
+      - origin
+    environment:
+      PRM_ADMIN_TOKEN: ${PRM_ADMIN_TOKEN:?required}
+      RULES_CONFIG: /data/config
+      RULES_STATE: /data/state
+      RULES_ORIGIN_URL: ${RULES_ORIGIN_URL:-http://origin:8081/active}
+      PUBLISH_SCHEDULE_ENABLED: ${PUBLISH_SCHEDULE_ENABLED:-1}
+    volumes:
+      - ${HOME_RULES_CONFIG:?required}:/data/config:ro
+      - ${HOME_RULES_STATE:?required}:/data/state
+    command: ["python3", "/app/schedule.py"]
+
+  origin:
+    image: ${HOME_RULES_IMAGE:?required}
+    restart: unless-stopped
+    user: ${HOME_RULES_USER:?required}
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      ORIGIN_ALLOWED_IP: ${ORIGIN_ALLOWED_IP:?required}
+    ports:
+      - "${ORIGIN_BIND:?required}:8080"
+    volumes:
+      - ${HOME_RULES_STATE:?required}:/data/state:ro
+    command: ["python3", "/app/origin.py"]
