@@ -23,7 +23,8 @@ jobs:
         run: |
           docker build --pull --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" --tag home-rules:test .
-          docker run --rm --user 12345:12345 home-rules:test python3 -m unittest -v
+          docker run --rm --user 12345:12345 home-rules:test sh -ec \
+            'command -v curl git nginx; python3 -m unittest -v'
       - name: Publish release tag
         if: github.ref_type == 'tag' && github.event_name == 'push'
         env:
