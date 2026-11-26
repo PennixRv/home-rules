@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 from time import monotonic, sleep
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import yaml
@@ -31,10 +31,17 @@ GEO_FIELDS = ("geosite", "geoip", "mmdb", "asn")
 ORIGIN = os.environ.get("RULES_ORIGIN_URL", "http://origin:8081/active").rstrip("/")
 PRM = os.environ.get("PRM_URL", "http://prm:3001").rstrip("/")
 VERSION = re.compile(r"\d{8}T\d{12}Z")
+TEMPORARY_FAILURE = 75
 
 
 class ReviewRequired(RuntimeError):
     pass
+
+
+def transient_network_error(error):
+    if isinstance(error, HTTPError):
+        return error.code in {408, 429} or 500 <= error.code <= 599
+    return isinstance(error, (URLError, TimeoutError, ConnectionError, IncompleteRead))
 
 
 def request(url, body=None, private=False, limit=64 << 20, timeout=45):
@@ -203,7 +210,7 @@ def update(policy, report, versions=None):
     deadline = monotonic() + 420
     while api("updates/current") is not None:
         if monotonic() >= deadline:
-            raise TimeoutError("PRM update did not finish")
+            raise RuntimeError("PRM update did not finish")
         sleep(2)
     status = api(f"updates/{job}")
     if status["scope"] != "all" or status["status"] != "completed" or status["rules_succeeded"] != len(desired):
@@ -538,6 +545,15 @@ def main():
         except Exception as exc:
             report["status"] = "review" if isinstance(exc, ReviewRequired) else "failed"
             report["detail"] = str(exc)
+            if (
+                args.action == "publish"
+                and report["initial_release"]
+                and current() == report["initial_release"]
+                and not (STATE / "pending.json").exists()
+                and transient_network_error(exc)
+            ):
+                report["retryable"] = True
+                raise SystemExit(TEMPORARY_FAILURE) from exc
             raise
         finally:
             report["finished"] = datetime.now(timezone.utc).isoformat()

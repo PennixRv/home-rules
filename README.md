@@ -16,7 +16,7 @@ docker compose logs publisher
 docker compose exec publisher python3 -m prm_release publish
 ```
 
-常规运行每天上海时间 `05:30` 触发，恢复时补跑最近一次错过的触发。`PUBLISH_SCHEDULE_ENABLED=0` 可暂停自动触发并保留手动命令。日志和 `state/last-check.json` 提供结果，校验拒绝的候选不会接管下载。首次需要 `linux/amd64` 的 Mihomo 时，发布器从官方发行版下载并核验已固定的摘要，然后在 NAS 发布状态中缓存。
+常规运行每天上海时间 `05:30` 触发，恢复时补跑最近一次错过的触发。临时网络错误在现役批次可确认、没有待恢复记录且 PRM 空闲时重试一次。`PUBLISH_SCHEDULE_ENABLED=0` 可暂停自动触发并保留手动命令。日志和 `state/last-check.json` 提供结果，校验拒绝的候选不会接管下载。首次需要 `linux/amd64` 的 Mihomo 时，发布器从官方发行版下载并核验已固定的摘要，然后在 NAS 发布状态中缓存。
 
 经过人工审阅的规则变更使用 `stage --reviewed /data/config/expected.yaml`，再按报告中的批次运行 `promote <batch>`。私有参考包含当时的 `base` 批次与完整预期 `bundle`，后者包含 `rule-providers`、`rules`。从已知批次构建时固定其规则源版本并沿用四库。首次发布的 `base` 为空字符串，参考须额外提供 `sources`，按源标识映射 `[仓库, 完整提交]`。预期规则应独立核对并保存在私有配置目录。
 

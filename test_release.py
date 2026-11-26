@@ -3,11 +3,13 @@ import unittest
 from datetime import datetime, timezone
 from http.client import IncompleteRead
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import prm_release as release
 import rule_changes
-from schedule import due_slot
+from schedule import due_slot, publish_slot
 import verify_release
 
 def bundle(**entries):
@@ -18,6 +20,23 @@ def bundle(**entries):
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_transient_failures_retry_once_and_review_does_not(self):
+        stop = SimpleNamespace(wait=lambda seconds: False)
+        temporary = SimpleNamespace(returncode=release.TEMPORARY_FAILURE)
+        with (
+            patch("schedule.subprocess.run", return_value=temporary) as run,
+            patch.object(release, "api", return_value=None),
+        ):
+            publish_slot(stop)
+            self.assertEqual(run.call_count, 2)
+        with patch("schedule.subprocess.run", return_value=SimpleNamespace(returncode=1)) as run:
+            publish_slot(stop)
+            run.assert_called_once()
+        self.assertTrue(release.transient_network_error(IncompleteRead(b"partial")))
+        with HTTPError("http://example", 404, "", {}, None) as missing:
+            self.assertFalse(release.transient_network_error(missing))
+        self.assertFalse(release.transient_network_error(release.ReviewRequired()))
+
     def test_due_slot_uses_the_last_shanghai_calendar_trigger(self):
         self.assertEqual(due_slot(datetime(2026, 11, 26, 21, 29, tzinfo=timezone.utc)), "2026-11-26")
         self.assertEqual(due_slot(datetime(2026, 11, 26, 21, 30, tzinfo=timezone.utc)), "2026-11-27")
