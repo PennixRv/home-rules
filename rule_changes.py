@@ -1,7 +1,7 @@
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from heapq import heappop, heappush
-from ipaddress import IPv4Address, IPv6Address, ip_network
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from itertools import chain
 
 from verify_release import target_index
@@ -102,11 +102,60 @@ def compare_ranges(prior, candidate, version, resolved):
             yield f"{address(point)}–{address(end - 1)}", left, right
 
 
-def compare(prior_bundle, candidate_bundle, automatic_additions=()):
+def interval(condition):
+    first, last = map(ip_address, condition.split("–"))
+    return first, last
+
+
+def mainland(reader, condition):
+    first, last = interval(condition)
+    address = type(first)
+    point = int(first)
+    while point <= int(last):
+        record, length = reader.get_with_prefix_len(address(point))
+        if (record or {}).get("country", {}).get("iso_code") != "CN":
+            return False
+        point = int(ip_network((address(point), length), strict=False).broadcast_address) + 1
+    return True
+
+
+def compare(prior_bundle, candidate_bundle, automatic_additions=(), *, automatic=None, country=None):
     prior = RuleIndex(prior_bundle)
     candidate = RuleIndex(candidate_bundle)
     summary = Counter()
     samples = defaultdict(list)
+    automatic = automatic or {}
+    proxy = set(automatic.get("proxy", ()))
+    services = automatic.get("services", {})
+    deferred = [interval(item) for item in automatic.get("deferred_direct", ())]
+    before = prior_bundle["rule-providers"]
+    after = candidate_bundle["rule-providers"]
+    removed = {
+        name: set(before[name]["payload"]) - set(after[name]["payload"])
+        for name in proxy & before.keys() & after.keys()
+    }
+
+    def permitted(kind, condition, old, new):
+        if old == prior.fallback:
+            if kind == "domain" and candidate.exact.get(condition) == new:
+                if new.target == "🛡️ 默认代理" and new.provider in proxy:
+                    return True
+                if new.target in {"🎬 媒体", "🎮 游戏"} and new.provider in services:
+                    return any(root in services[new.provider] for root in domain_suffixes(condition))
+            if (
+                kind in {"ipv4", "ipv6"} and new.provider == "domestic-ip" and new.target == "DIRECT"
+                and automatic.get("domestic_ip") and country
+            ):
+                low, high = interval(condition)
+                if not any(first.version == low.version and first <= high and low <= last
+                           for first, last in deferred):
+                    return mainland(country, condition)
+        if (
+            automatic.get("proxy_removals") and kind == "domain" and new == candidate.fallback
+            and old.target == "🛡️ 默认代理" and prior.exact.get(condition) == old
+        ):
+            return removed.get(old.provider) == {f"DOMAIN,{condition}"}
+        return False
 
     def record(status, kind, condition, old, new):
         key = (status, kind, old.target, new.target, old.provider, new.provider)
@@ -129,6 +178,8 @@ def compare(prior_bundle, candidate_bundle, automatic_additions=()):
             status = "conditional"
         elif old.target == new.target:
             status = "equivalent"
+        elif permitted(kind, condition, old, new):
+            status = "allowed"
         elif old == prior.fallback and new.provider in automatic_additions:
             status = "allowed"
         else:

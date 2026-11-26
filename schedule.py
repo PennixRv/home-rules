@@ -13,18 +13,21 @@ import prm_release
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-DAILY = time(5, 30)
+CHECK_HOURS = range(5, 24, 3)
 
 
 def due_slot(now):
     local = now.astimezone(SHANGHAI)
-    return (local.date() if local.time() >= DAILY else local.date() - timedelta(days=1)).isoformat()
+    hour = next((hour for hour in reversed(CHECK_HOURS) if local.time() >= time(hour, 30)), None)
+    day = local.date() if hour is not None else local.date() - timedelta(days=1)
+    return f"{day}T{hour if hour is not None else CHECK_HOURS[-1]:02d}:30"
 
 
-def publish_slot(stop):
+def publish_slot(stop, slot):
+    command = [sys.executable, "-m", "prm_release", "publish", "--slot", slot]
     for attempt in range(2):
         try:
-            result = subprocess.run([sys.executable, "-m", "prm_release", "publish"], timeout=840)
+            result = subprocess.run(command, timeout=840)
         except subprocess.TimeoutExpired:
             print("Scheduled publication reached its timeout", flush=True)
             return
@@ -58,8 +61,8 @@ def main():
     while not stop.is_set():
         slot = due_slot(datetime.now(timezone.utc))
         if not marker.exists() or marker.read_text().strip() < slot:
-            print(f"Scheduled publication for {slot} 05:30 Asia/Shanghai", flush=True)
-            publish_slot(stop)
+            print(f"Scheduled publication for {slot} Asia/Shanghai", flush=True)
+            publish_slot(stop, slot)
             pending = marker.with_suffix(".scheduled-slot.tmp")
             pending.write_text(slot + "\n")
             pending.replace(marker)

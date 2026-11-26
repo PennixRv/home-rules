@@ -1,10 +1,12 @@
 import argparse
+from contextlib import nullcontext
+from datetime import datetime, timezone
 import fcntl
 import gzip
+from hashlib import sha256
+from http.client import IncompleteRead
 import json
 import os
-from datetime import datetime, timezone
-from http.client import IncompleteRead
 from pathlib import Path
 import re
 import shutil
@@ -184,14 +186,15 @@ def rule_updates(existing, desired):
     return operations
 
 
-def update(policy, report, versions=None):
+def update(policy, report, versions=None, *, resolved=None):
     if versions is None:
         versions = sources(policy)
     report["sources"] = versions
-    desired = desired_rules(policy, versions)
+    desired = resolved if resolved is not None else desired_rules(policy, versions)
     initial = api("config")
     running = initial["config"]
     checked_config(running, desired)
+    report["previous_provider_layout_matches"] = unpinned(running["rules"]) == unpinned(desired)
     operations = rule_updates(running["rules"], desired)
     for kind in GEO_FIELDS:
         if kind in running:
@@ -213,9 +216,22 @@ def update(policy, report, versions=None):
             raise RuntimeError("PRM update did not finish")
         sleep(2)
     status = api(f"updates/{job}")
-    if status["scope"] != "all" or status["status"] != "completed" or status["rules_succeeded"] != len(desired):
-        summary = [f'{issue["stage"]}/{issue["subject"]}: {issue["message"]}' for issue in status["issues"][:4]]
+    issues = status["issues"]
+    failed = {issue["subject"] for issue in issues if issue["stage"] == "rule"}
+    partial = (
+        status["status"] == "completed_with_errors" and issues
+        and all(issue["stage"] == "rule" for issue in issues)
+        and failed <= {rule["id"] for rule in desired}
+        and status["rules_failed"] == len(failed)
+        and status["rules_succeeded"] + len(failed) == len(desired)
+    )
+    if status["scope"] != "all" or not (partial or (
+        status["status"] == "completed" and status["rules_succeeded"] == len(desired) and not issues
+    )):
+        summary = [f'{issue["stage"]}/{issue["subject"]}: {issue["message"]}' for issue in issues[:4]]
         raise RuntimeError(f"PRM update {job} {status['status']}: {summary or status['warnings'][:4]}")
+    if partial:
+        report["rule_failures"] = {name: [i["message"] for i in issues if i["subject"] == name] for name in sorted(failed)}
     return versions, config, job
 
 
@@ -242,17 +258,50 @@ def db_ip_file(public, name, kind, month, prior, prior_geo):
     return {"source": "DB-IP Lite", "version": month, "url": url, "license": "CC BY 4.0"}
 
 
-def collect_geo(public, prior, prior_geo):
-    result = {}
+def geo_versions(prior_geo, failures):
+    wanted = {}
     for name, repository in GEO_DAT.items():
-        commit = revision(repository, "release")
-        url = f"https://raw.githubusercontent.com/{repository}/{commit}/{name.lower()}"
-        (public / name).write_bytes(request(url))
-        result[name] = {"source": repository, "version": commit, "url": url}
+        try:
+            wanted[name] = revision(repository, "release")
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            if prior_geo.get(name, {}).get("source") != repository:
+                raise
+            wanted[name] = prior_geo[name]["version"]
+            failures[name] = str(exc)
+    wanted.update(dict.fromkeys(DB_IP, datetime.now(timezone.utc).strftime("%Y-%m")))
+    return wanted
+
+
+def collect_geo(public, prior, prior_geo, wanted=None, failures=None):
+    if failures is None:
+        failures = {}
+    if wanted is None:
+        wanted = geo_versions(prior_geo, failures)
+    result = {}
+    for name in (*GEO_DAT, *DB_IP):
+        repository = GEO_DAT.get(name)
+        version = wanted[name]
+        previous = prior_geo.get(name, {})
+        target = public / name
+        try:
+            if previous.get("version") == version and previous["source"] == (repository or "DB-IP Lite"):
+                shutil.copyfile(prior / name, target)
+                result[name] = previous
+            elif repository:
+                url = f"https://raw.githubusercontent.com/{repository}/{version}/{name.lower()}"
+                target.write_bytes(request(url))
+                result[name] = {"source": repository, "version": version, "url": url}
+            else:
+                result[name] = db_ip_file(public, name, DB_IP[name], version, prior, previous)
+                if "pending_month" in result[name]:
+                    failures[name] = f"DB-IP {version} is not available"
+        except (OSError, ValueError, RuntimeError, EOFError, IncompleteRead, subprocess.TimeoutExpired) as exc:
+            if previous.get("source") != (repository or "DB-IP Lite"):
+                raise
+            shutil.copyfile(prior / name, target)
+            result[name] = previous
+            failures[name] = str(exc)
     result["GeoIP.dat"]["license"] = "CC BY-SA 4.0"
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
-    for name, kind in DB_IP.items():
-        result[name] = db_ip_file(public, name, kind, month, prior, prior_geo.get(name, {}))
     return result
 
 
@@ -360,6 +409,36 @@ def eligible_geo(metadata):
             and all(geo.get(name, {}).get("source") == "DB-IP Lite" for name in DB_IP))
 
 
+def local_config_versions():
+    return {name: sha256((POLICY_DIR / name).read_bytes()).hexdigest()
+            for name in ("sources.yaml", "household-rules.yaml", "probes.yaml")}
+
+
+def automatic_inputs(policy, report, metadata):
+    local = local_config_versions()
+    if yaml.safe_load((POLICY_DIR / "sources.yaml").read_bytes()) != policy:
+        raise RuntimeError("Rule source policy changed before validation")
+    observed = {}
+    failures = {}
+    for name, (repo, branch) in policy["sources"].items():
+        try:
+            observed[name] = [repo, revision(repo, branch)]
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            previous = metadata["sources"].get(name)
+            if not previous or previous[0] != repo:
+                raise
+            observed[name] = previous
+            failures[name] = str(exc)
+    geo_failures = {}
+    geo = geo_versions(metadata["geo"], geo_failures)
+    report.update({"source_failures": failures, "geo_failures": geo_failures})
+    return {"sources": observed, "geo": geo, "local_config": local}
+
+
+def memoizable(report):
+    return not any(report.get(key) for key in ("source_failures", "geo_failures", "rule_failures", "output_failures"))
+
+
 def migration_fallback(old, candidate):
     source = RELEASES / old
     staged = RELEASES / candidate
@@ -390,18 +469,93 @@ def migration_fallback(old, candidate):
     return version
 
 
+def provider_inputs(metadata, policy):
+    return metadata.get("rule_inputs") or {
+        rule["id"]: rule for rule in desired_rules(policy, metadata["sources"])
+    }
+
+
+def fixed_provider_versions(desired, previous):
+    def unversioned(entry):
+        return unpinned([{"sources": [entry]}])[0]["sources"][0].get("url")
+
+    for rule in desired:
+        known = {
+            unversioned(entry): entry["url"]
+            for entry in previous.get(rule["id"], {}).get("sources", ()) if "url" in entry
+        }
+        rule["sources"] = [
+            entry | {"url": known[unversioned(entry)]} if unversioned(entry) in known else entry
+            for entry in rule["sources"]
+        ]
+    return desired
+
+
+def read_provider(raw):
+    payload = yaml.safe_load(raw)["payload"]
+    if not isinstance(payload, list) or not payload or any(not isinstance(item, str) for item in payload):
+        raise ValueError("Invalid PRM rule payload")
+    return {"type": "inline", "behavior": "classical", "payload": payload}
+
+
+def dependent_providers(failed, inputs):
+    held = set(failed)
+    while True:
+        urls = {entry["url"] for name in held for entry in inputs[name]["sources"] if "url" in entry}
+        more = {
+            name for name, rule in inputs.items()
+            if any(entry.get("ref") in held or entry.get("url") in urls for entry in rule["sources"])
+        } - held
+        if not more:
+            return held
+        held.update(more)
+
+
+def review_providers(changes, old, bundle):
+    changed = {
+        name for name, value in bundle["rule-providers"].items()
+        if value != old["rule-providers"].get(name)
+    }
+    failed = set()
+    for row in changes:
+        if row["status"] in {"review", "conditional"}:
+            implicated = {row["previous_provider"], row["candidate_provider"]} & changed
+            if not implicated:
+                raise ReviewRequired("Routing difference cannot be attributed to a changed provider")
+            failed.update(implicated)
+    return failed
+
+
+def allowed_probes(changes, side):
+    probes = {}
+    for item in changes:
+        if item["status"] != "allowed" or item["kind"] not in {"domain", "ipv4", "ipv6"}:
+            continue
+        provider = item[f"{side}_provider"]
+        match = f"RuleSet({provider})" if provider else "Match"
+        for sample in item["samples"]:
+            addresses = rule_changes.interval(sample) if item["kind"] in {"ipv4", "ipv6"} else ()
+            hosts = [f"[{value}]" if value.version == 6 else str(value)
+                     for value in addresses] if addresses else [sample]
+            for host in hosts:
+                probes[host] = (match, item[f"{side}_target"])
+    return probes
+
+
 def build_release(policy, report, release, reviewed=None):
     base = current()
     prior = (RELEASES / base / "public") if base else None
     prior_metadata = json.loads((prior.parent / "manifest.json").read_bytes()) if prior else {}
     prior_geo = prior_metadata.get("geo", {})
-    pins = None
+    pins = resolved = None
+    observed = report.get("input_snapshot")
     if reviewed is not None:
         if not isinstance(reviewed, dict) or reviewed.get("base") != base:
             raise ReviewRequired("Reviewed rules reference a different current batch")
         if not isinstance(reviewed.get("bundle"), dict):
             raise ReviewRequired("Reviewed rules require the complete expected bundle")
-        pins = prior_metadata["sources"] if prior else reviewed.get("sources")
+        manual_upstream = prior and "sources" in reviewed
+        pins = reviewed.get("sources") if manual_upstream or not prior else prior_metadata["sources"]
         if not isinstance(pins, dict) or pins.keys() != policy["sources"].keys() or any(
             not isinstance(pin, (tuple, list)) or len(pin) != 2
             or pin[0] != policy["sources"][key][0]
@@ -410,27 +564,72 @@ def build_release(policy, report, release, reviewed=None):
         ):
             raise ReviewRequired("Reviewed rules require fixed revisions for all declared repositories")
         report["reviewed_base"] = base
+        if prior and prior_metadata.get("rule_inputs"):
+            desired = desired_rules(policy, pins)
+            previous = prior_metadata["rule_inputs"]
+            if manual_upstream:
+                advancing = reviewed.get("advance")
+                if (not isinstance(advancing, list) or not advancing
+                        or not all(isinstance(name, str) and name in policy["providers"] for name in advancing)):
+                    raise ReviewRequired("Name the reviewed rule providers in advance")
+                previous = {name: rule for name, rule in previous.items() if name not in advancing}
+            resolved = fixed_provider_versions(desired, previous)
     elif prior is None:
         raise ReviewRequired("First publication requires an independent reviewed bundle")
 
-    versions, config, job = update(policy, report, pins)
+    if observed:
+        pins = observed["sources"]
+    if resolved is None:
+        versions, config, job = update(policy, report, pins)
+    else:
+        versions, config, job = update(policy, report, pins, resolved=resolved)
     public = release / "public"
     rule_files = public / "rules/mihomo"
     rule_files.mkdir(parents=True, exist_ok=False)
     providers = {}
+    old = yaml.safe_load((prior.parent / "rules.yaml").read_bytes()) if prior else None
+    held = set(report.get("rule_failures", ()))
+    inputs = {rule["id"]: rule for rule in config.get("config", {}).get("rules", ())}
+    previous_inputs = provider_inputs(prior_metadata, policy) if prior and not reviewed else {}
+
+    def keep_previous(names):
+        if not prior or reviewed is not None:
+            raise RuntimeError("Reviewed candidate must compile all rule providers")
+        if not prior_metadata.get("rule_inputs") and not report.get("previous_provider_layout_matches"):
+            raise RuntimeError("Previous rule layout cannot be verified")
+        for name in dependent_providers(names, inputs):
+            if name not in previous_inputs or unpinned([previous_inputs[name]]) != unpinned([inputs[name]]):
+                raise RuntimeError(f"Previous rule inputs cannot be verified for {name}")
+            raw = (prior / "rules/mihomo" / f"{name}.yaml").read_bytes()
+            if read_provider(raw) != old["rule-providers"].get(name):
+                raise RuntimeError(f"Previous rule content differs from the accepted bundle for {name}")
+            (rule_files / f"{name}.yaml").write_bytes(raw)
+            providers[name] = old["rule-providers"][name]
+            report.setdefault("retained_providers", {})[name] = previous_inputs[name]["sources"]
+        return set(report["retained_providers"])
+
+    if held:
+        held = keep_previous(held)
     for name in policy["providers"]:
-        raw = request(f"{PRM}/rules/mihomo/{name}.yaml")
-        payload = yaml.safe_load(raw)["payload"]
-        if not isinstance(payload, list) or not payload or any(not isinstance(item, str) for item in payload):
-            raise ValueError(f"Invalid PRM payload for {name}")
-        providers[name] = {"type": "inline", "behavior": "classical", "payload": payload}
+        if name in held:
+            continue
+        try:
+            raw = request(f"{PRM}/rules/mihomo/{name}.yaml")
+            providers[name] = read_provider(raw)
+        except (OSError, RuntimeError, IncompleteRead, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
+            if not prior or reviewed is not None:
+                raise
+            report.setdefault("output_failures", {})[name] = str(exc)
+            held = keep_previous(held | {name})
+            continue
         (rule_files / f"{name}.yaml").write_bytes(raw)
     if reviewed is not None and prior is not None:
         for name in (*GEO_DAT, *DB_IP):
             shutil.copyfile(prior / name, public / name)
         geo_versions = prior_geo
     else:
-        geo_versions = collect_geo(public, prior or STATE / "current" / "public", prior_geo)
+        geo_versions = collect_geo(public, prior, prior_geo, observed["geo"] if observed else None,
+                                   report.setdefault("geo_failures", {}))
     report["geo"] = geo_versions
     if (api("updates/current") is not None
             or api("updates?limit=1")["items"][0]["id"] != job or api("config") != config):
@@ -441,20 +640,44 @@ def build_release(policy, report, release, reviewed=None):
     ):
         raise ValueError("Invalid household rules")
     rules = [*policy["early_rules"], *household, *policy["rules"]]
+    providers = {name: providers[name] for name in policy["providers"]}
     bundle = {"rule-providers": providers, "rules": rules}
     if reviewed is not None and bundle != reviewed["bundle"]:
         raise ReviewRequired("Compiled rules differ from the complete reviewed bundle")
-    verify_release.check_core(release, public, providers, rules, converged=True)
+    changes = []
     if prior is not None:
-        old = yaml.safe_load((prior.parent / "rules.yaml").read_bytes())
-        changes = rule_changes.compare(old, bundle, policy.get("automatic_additions", ()))
+        if reviewed is None and (old["rules"] != rules or old["rule-providers"].keys() != providers.keys()):
+            raise ReviewRequired("Changes to routing order, household rules or rule inventory require a reviewed bundle")
+        automatic = policy.get("automatic_updates", {})
+        legacy = policy.get("automatic_additions", ()) if "automatic_updates" not in policy else ()
+        country = nullcontext()
+        if reviewed is None and automatic.get("domestic_ip"):
+            import maxminddb
+            try:
+                country = maxminddb.open_database(prior / "Country.mmdb")
+            except (OSError, ValueError) as exc:
+                report["country_check_unavailable"] = str(exc)
+        with country as reader:
+            changes = rule_changes.compare(old, bundle, legacy, automatic=automatic, country=reader)
+            report["rule_changes"] = changes
+            if reviewed is None and any(row["status"] in {"review", "conditional"} for row in changes):
+                blocked = review_providers(changes, old, bundle)
+                report["reviewed_out"] = changes
+                held = keep_previous(held | blocked)
+                changes = rule_changes.compare(old, bundle, legacy, automatic=automatic, country=reader)
         report["rule_changes"] = changes
         if reviewed is None and any(change["status"] in {"review", "conditional"} for change in changes):
             raise ReviewRequired("Rule differences require review; see state/last-check.json")
+    verify_release.check_core(release, public, providers, rules, converged=True,
+                              additional=allowed_probes(changes, "candidate"))
+    if prior is not None:
         verify_release.check_core(release, prior, providers, rules, converged=True)
-        verify_release.check_core(release, public, old["rule-providers"], old["rules"])
+        verify_release.check_core(release, public, old["rule-providers"], old["rules"],
+                                  additional=allowed_probes(changes, "previous"))
     (release / "rules.yaml").write_text(yaml.safe_dump(bundle, allow_unicode=True, sort_keys=False))
+    actual_inputs = {name: previous_inputs[name] if name in held else value for name, value in inputs.items()}
     metadata = {"version": release.name, "base": base, "sources": versions, "geo": geo_versions, "job": job,
+                "rule_inputs": actual_inputs,
                 "files": [str(p.relative_to(public)) for p in sorted(public.rglob("*")) if p.is_file()]}
     write_json(release / "manifest.json", metadata)
 
@@ -513,8 +736,39 @@ def run(action, version, policy, report, reviewed=None):
         checked_config(observed, desired_rules(policy, policy["sources"]))
         write_json(STATE / "managed-config.json", observed)
         return "configuration-recorded"
+    base = current()
+    if action == "publish" and base:
+        prior = RELEASES / base
+        metadata = json.loads((prior / "manifest.json").read_bytes())
+        report["input_snapshot"] = automatic_inputs(policy, report, metadata)
+        slot = report.get("slot")
+        last_scheduled = STATE / "last-scheduled.json"
+        if slot:
+            previous = json.loads(last_scheduled.read_bytes()) if last_scheduled.exists() else {}
+            if previous.get("public_check_day") != slot[:10]:
+                check_public(prior / "public")
+            report["public_check_day"] = slot[:10]
+            if (
+                previous.get("status") in {"published", "unchanged", "review"}
+                and previous.get("current_release") == base
+                and previous.get("input_snapshot") == report["input_snapshot"]
+                and memoizable(previous) and memoizable(report)
+            ):
+                for key in ("retained_providers", "reviewed_out", "rule_changes", "detail"):
+                    if key in previous:
+                        report[key] = previous[key]
+                report["skipped_build"] = True
+                return "review" if previous["status"] == "review" else "unchanged"
     candidate = stage(policy, report, reviewed)
-    return publish(candidate) if action == "publish" else "staged"
+    if action != "publish":
+        return "staged"
+    if base and report["input_snapshot"]["local_config"] != local_config_versions():
+        shutil.rmtree(RELEASES / candidate)
+        raise RuntimeError("Local rule inputs changed during validation")
+    status = publish(candidate)
+    if report.get("slot"):
+        report["public_check_day"] = report["slot"][:10]
+    return status
 
 
 def main():
@@ -522,22 +776,27 @@ def main():
     parser.add_argument("action", choices=["seed", "stage", "publish", "promote", "rollback", "adopt-config"])
     parser.add_argument("version", nargs="?")
     parser.add_argument("--reviewed", type=Path, help="Private YAML with the base and complete expected rules")
+    parser.add_argument("--slot", help="Scheduled Shanghai check as YYYY-MM-DDTHH:MM")
     args = parser.parse_args()
     os.umask(0o077)
-    policy = yaml.safe_load((POLICY_DIR / "sources.yaml").read_bytes())
     if args.action == "seed":
-        seed(policy)
+        seed(yaml.safe_load((POLICY_DIR / "sources.yaml").read_bytes()))
         return
     if args.action in ("promote", "rollback") and (not args.version or not VERSION.fullmatch(args.version)):
         parser.error(f"{args.action} requires a version")
     if args.reviewed and args.action != "stage":
         parser.error("--reviewed requires stage")
+    if args.slot and (args.action != "publish" or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d", args.slot)):
+        parser.error("--slot is only for scheduled publish")
     RELEASES.mkdir(parents=True, exist_ok=True)
     with (STATE / ".publish.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         report = {"started": datetime.now(timezone.utc).isoformat(), "action": args.action,
                   "initial_release": current()}
+        if args.slot:
+            report["slot"] = args.slot
         try:
+            policy = yaml.safe_load((POLICY_DIR / "sources.yaml").read_bytes())
             reviewed = yaml.safe_load(args.reviewed.read_bytes()) if args.reviewed else None
             if args.reviewed and not isinstance(reviewed, dict):
                 raise ReviewRequired("Invalid reviewed rules document")
@@ -559,6 +818,8 @@ def main():
             report["finished"] = datetime.now(timezone.utc).isoformat()
             report["current_release"] = current()
             write_json(STATE / "last-check.json", report)
+            if args.slot:
+                write_json(STATE / "last-scheduled.json", report)
             if report.get("status") in {"published", "unchanged", "rolled-back"}:
                 write_json(STATE / "last-success.json", report)
             print("Rule release:", report.get("status", "interrupted"),

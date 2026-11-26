@@ -56,7 +56,7 @@ def check_policy(providers, rules):
             raise ValueError(f"Domestic domain coverage lost: {host}")
 
 
-def check_core(root, geo, providers, rules, converged=False):
+def check_core(root, geo, providers, rules, converged=False, additional=None):
     check_policy(providers, rules)
     if converged:
         port_conditions = ("DST-PORT,", "SRC-PORT,")
@@ -79,6 +79,8 @@ def check_core(root, geo, providers, rules, converged=False):
         for name in ("GeoSite.dat", "GeoIP.dat", "Country.mmdb", "ASN.mmdb"):
             shutil.copyfile(geo / name, probe_dir / name)
         run_probes(binary, probe_dir, providers, rules, False, probes)
+        if additional:
+            run_probes(binary, probe_dir, providers, rules, False, additional)
         geo_rules = [
             "GEOSITE,category-ai-!cn,PROBE",
             "GEOSITE,category-games,PROBE",
