@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from http.client import IncompleteRead
 from pathlib import Path
 from unittest.mock import patch
 
@@ -89,6 +90,58 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "configuration drift"):
             release.checked_config(initial | {"rules": [self.rule | {"ops": [{"type": "exclude_kinds"}]}]}, [self.rule])
 
+    def test_reviewed_stage_cannot_hide_extra_rules_or_switch_the_live_batch(self):
+        import yaml
+
+        old = "20261126T000001000000Z"
+        source = ["org/repo", "a" * 40]
+        policy = {"providers": {"ordinary": {}}, "sources": {"origin": ["org/repo", "main"]},
+                  "early_rules": [], "rules": ["RULE-SET,ordinary,PROXY", "MATCH,DIRECT"]}
+        public = self.setup_release(old, "")
+        manifest = {"version": old, "base": "", "files": sorted(p.name for p in public.iterdir()),
+                    "sources": {"origin": source}, "geo": {}}
+        release.write_json(public.parent / "manifest.json", manifest)
+        release.point("current", old)
+        (release.STATE / "household-rules.yaml").write_text('["DOMAIN,local,DIRECT"]')
+        before = {"rule-providers": {"ordinary": {"type": "inline", "behavior": "classical",
+                                                 "payload": ["DOMAIN,old.example"]}},
+                  "rules": ["DOMAIN,local,DIRECT", *policy["rules"]]}
+        (public.parent / "rules.yaml").write_text(yaml.safe_dump(before))
+        expected = before | {"rule-providers": {"ordinary": before["rule-providers"]["ordinary"] |
+                                               {"payload": ["DOMAIN,new.example"]}}}
+        reviewed = {"base": old, "bundle": expected}
+        config = {"version": 7}
+        with (
+            patch.multiple(release, POLICY_DIR=release.STATE),
+            patch.object(release, "update", return_value=({"origin": source}, config, 12)) as update,
+            patch.object(release, "api", side_effect=lambda endpoint: {
+                "updates/current": None, "updates?limit=1": {"items": [{"id": 12}]}, "config": config,
+            }[endpoint]),
+            patch.object(release, "request", return_value=b"payload: ['DOMAIN,new.example','DOMAIN,extra.example']") as fetch,
+            patch.object(verify_release, "check_core"),
+        ):
+            with self.assertRaisesRegex(release.ReviewRequired, "different current batch"):
+                release.stage(policy, {}, reviewed | {"base": ""})
+            update.assert_not_called()
+            with self.assertRaisesRegex(release.ReviewRequired, "complete reviewed bundle"):
+                release.stage(policy, {}, reviewed)
+            self.assertEqual(list(release.RELEASES.iterdir()), [public.parent])
+            fetch.return_value = b"payload: ['DOMAIN,new.example']"
+            info = {}
+            staged = release.stage(policy, info, reviewed)
+            update.assert_called_with(policy, info, {"origin": source})
+            self.assertEqual(release.current(), old)
+            self.assertEqual((release.RELEASES / staged / "public/GeoIP.dat").read_bytes(),
+                             (public / "GeoIP.dat").read_bytes())
+
+    def test_first_stage_requires_reviewed_coverage_and_automatic_publish_cannot_use_it(self):
+        with patch.object(release, "update") as update:
+            with self.assertRaisesRegex(release.ReviewRequired, "independent reviewed bundle"):
+                release.stage({}, {})
+            with self.assertRaisesRegex(ValueError, "explicit promotion"):
+                release.run("publish", None, {}, {}, {"base": "", "bundle": {}})
+            update.assert_not_called()
+
     def test_native_config_operations_cover_add_remove_and_reorder(self):
         wanted = [self.rule | {"id": "new"}, self.rule]
         operations = release.rule_updates([self.rule, self.rule | {"id": "retired"}], wanted)
@@ -166,15 +219,17 @@ class ReleaseTests(unittest.TestCase):
         candidate = "20261126T000002000000Z"
         public = self.setup_release(old, "")
         self.setup_release(candidate, old)
-        release.point("current", candidate)
         pending = release.STATE / "pending.json"
-        release.write_json(pending, {"old": old, "version": candidate})
-        with patch.object(release, "check_public", side_effect=[RuntimeError("missing file"), None]) as check:
-            with self.assertRaisesRegex(RuntimeError, "missing file"):
-                release.recover()
-            self.assertEqual(check.call_args_list[-1].args, (public,))
-        self.assertEqual(release.current(), old)
-        self.assertFalse(pending.exists())
+        for failure in (RuntimeError("missing file"), IncompleteRead(b"partial", 1)):
+            with self.subTest(failure=failure):
+                release.point("current", candidate)
+                release.write_json(pending, {"old": old, "version": candidate})
+                with patch.object(release, "check_public", side_effect=[failure, None]) as check:
+                    with self.assertRaises(type(failure)):
+                        release.recover()
+                    self.assertEqual(check.call_args_list[-1].args, (public,))
+                self.assertEqual(release.current(), old)
+                self.assertFalse(pending.exists())
 
 
 if __name__ == "__main__":

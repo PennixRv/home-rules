@@ -4,6 +4,7 @@ import gzip
 import json
 import os
 from datetime import datetime, timezone
+from http.client import IncompleteRead
 from pathlib import Path
 import re
 import shutil
@@ -176,8 +177,9 @@ def rule_updates(existing, desired):
     return operations
 
 
-def update(policy, report):
-    versions = sources(policy)
+def update(policy, report, versions=None):
+    if versions is None:
+        versions = sources(policy)
     report["sources"] = versions
     desired = desired_rules(policy, versions)
     initial = api("config")
@@ -312,7 +314,7 @@ def recover():
     if live == version:
         try:
             check_public(RELEASES / version / "public")
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError, IncompleteRead):
             if fallback:
                 release_files(RELEASES / fallback)
             point("current", fallback)
@@ -330,13 +332,15 @@ def recover():
     pending.unlink()
 
 
-def stage(policy, report):
+def stage(policy, report, reviewed=None):
+    if (STATE / "pending.json").exists():
+        raise RuntimeError("Resolve the pending publication before staging")
     version = release_version()
     release = RELEASES / version
     release.mkdir()
     report["candidate"] = version
     try:
-        build_release(policy, report, release)
+        build_release(policy, report, release, reviewed)
     except BaseException:
         shutil.rmtree(release)
         raise
@@ -379,8 +383,30 @@ def migration_fallback(old, candidate):
     return version
 
 
-def build_release(policy, report, release):
-    versions, config, job = update(policy, report)
+def build_release(policy, report, release, reviewed=None):
+    base = current()
+    prior = (RELEASES / base / "public") if base else None
+    prior_metadata = json.loads((prior.parent / "manifest.json").read_bytes()) if prior else {}
+    prior_geo = prior_metadata.get("geo", {})
+    pins = None
+    if reviewed is not None:
+        if not isinstance(reviewed, dict) or reviewed.get("base") != base:
+            raise ReviewRequired("Reviewed rules reference a different current batch")
+        if not isinstance(reviewed.get("bundle"), dict):
+            raise ReviewRequired("Reviewed rules require the complete expected bundle")
+        pins = prior_metadata["sources"] if prior else reviewed.get("sources")
+        if not isinstance(pins, dict) or pins.keys() != policy["sources"].keys() or any(
+            not isinstance(pin, (tuple, list)) or len(pin) != 2
+            or pin[0] != policy["sources"][key][0]
+            or not isinstance(pin[1], str) or not re.fullmatch("[a-f0-9]{40}", pin[1])
+            for key, pin in pins.items()
+        ):
+            raise ReviewRequired("Reviewed rules require fixed revisions for all declared repositories")
+        report["reviewed_base"] = base
+    elif prior is None:
+        raise ReviewRequired("First publication requires an independent reviewed bundle")
+
+    versions, config, job = update(policy, report, pins)
     public = release / "public"
     rule_files = public / "rules/mihomo"
     rule_files.mkdir(parents=True, exist_ok=False)
@@ -392,10 +418,12 @@ def build_release(policy, report, release):
             raise ValueError(f"Invalid PRM payload for {name}")
         providers[name] = {"type": "inline", "behavior": "classical", "payload": payload}
         (rule_files / f"{name}.yaml").write_bytes(raw)
-    prior = STATE / "current" / "public"
-    prior_manifest = prior.parent / "manifest.json"
-    prior_geo = json.loads(prior_manifest.read_bytes())["geo"] if prior_manifest.is_file() else {}
-    geo_versions = collect_geo(public, prior, prior_geo)
+    if reviewed is not None and prior is not None:
+        for name in (*GEO_DAT, *DB_IP):
+            shutil.copyfile(prior / name, public / name)
+        geo_versions = prior_geo
+    else:
+        geo_versions = collect_geo(public, prior or STATE / "current" / "public", prior_geo)
     report["geo"] = geo_versions
     if (api("updates/current") is not None
             or api("updates?limit=1")["items"][0]["id"] != job or api("config") != config):
@@ -407,17 +435,19 @@ def build_release(policy, report, release):
         raise ValueError("Invalid household rules")
     rules = [*policy["early_rules"], *household, *policy["rules"]]
     bundle = {"rule-providers": providers, "rules": rules}
+    if reviewed is not None and bundle != reviewed["bundle"]:
+        raise ReviewRequired("Compiled rules differ from the complete reviewed bundle")
     verify_release.check_core(release, public, providers, rules, converged=True)
-    if prior.exists():
+    if prior is not None:
         old = yaml.safe_load((prior.parent / "rules.yaml").read_bytes())
         changes = rule_changes.compare(old, bundle, policy.get("automatic_additions", ()))
         report["rule_changes"] = changes
-        if any(change["status"] in {"review", "conditional"} for change in changes):
+        if reviewed is None and any(change["status"] in {"review", "conditional"} for change in changes):
             raise ReviewRequired("Rule differences require review; see state/last-check.json")
         verify_release.check_core(release, prior, providers, rules, converged=True)
         verify_release.check_core(release, public, old["rule-providers"], old["rules"])
     (release / "rules.yaml").write_text(yaml.safe_dump(bundle, allow_unicode=True, sort_keys=False))
-    metadata = {"version": release.name, "base": current(), "sources": versions, "geo": geo_versions, "job": job,
+    metadata = {"version": release.name, "base": base, "sources": versions, "geo": geo_versions, "job": job,
                 "files": [str(p.relative_to(public)) for p in sorted(public.rglob("*")) if p.is_file()]}
     write_json(release / "manifest.json", metadata)
 
@@ -456,7 +486,9 @@ def publish(version, rollback=False):
     return "rolled-back" if rollback else "published"
 
 
-def run(action, version, policy, report):
+def run(action, version, policy, report, reviewed=None):
+    if reviewed is not None and action != "stage":
+        raise ValueError("Reviewed rules may only be staged for explicit promotion")
     if action in ("publish", "promote", "rollback"):
         recover()
     if action in ("promote", "rollback"):
@@ -474,7 +506,7 @@ def run(action, version, policy, report):
         checked_config(observed, desired_rules(policy, policy["sources"]))
         write_json(STATE / "managed-config.json", observed)
         return "configuration-recorded"
-    candidate = stage(policy, report)
+    candidate = stage(policy, report, reviewed)
     return publish(candidate) if action == "publish" else "staged"
 
 
@@ -482,6 +514,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["seed", "stage", "publish", "promote", "rollback", "adopt-config"])
     parser.add_argument("version", nargs="?")
+    parser.add_argument("--reviewed", type=Path, help="Private YAML with the base and complete expected rules")
     args = parser.parse_args()
     os.umask(0o077)
     policy = yaml.safe_load((POLICY_DIR / "sources.yaml").read_bytes())
@@ -490,13 +523,18 @@ def main():
         return
     if args.action in ("promote", "rollback") and (not args.version or not VERSION.fullmatch(args.version)):
         parser.error(f"{args.action} requires a version")
+    if args.reviewed and args.action != "stage":
+        parser.error("--reviewed requires stage")
     RELEASES.mkdir(parents=True, exist_ok=True)
     with (STATE / ".publish.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         report = {"started": datetime.now(timezone.utc).isoformat(), "action": args.action,
                   "initial_release": current()}
         try:
-            report["status"] = run(args.action, args.version, policy, report)
+            reviewed = yaml.safe_load(args.reviewed.read_bytes()) if args.reviewed else None
+            if args.reviewed and not isinstance(reviewed, dict):
+                raise ReviewRequired("Invalid reviewed rules document")
+            report["status"] = run(args.action, args.version, policy, report, reviewed)
         except Exception as exc:
             report["status"] = "review" if isinstance(exc, ReviewRequired) else "failed"
             report["detail"] = str(exc)
