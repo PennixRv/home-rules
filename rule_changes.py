@@ -125,6 +125,7 @@ def compare(prior_bundle, candidate_bundle, automatic_additions=(), *, automatic
     summary = Counter()
     samples = defaultdict(list)
     automatic = automatic or {}
+    roles = automatic.get("roles", {})
     proxy = set(automatic.get("proxy", ()))
     services = automatic.get("services", {})
     deferred = [interval(item) for item in automatic.get("deferred_direct", ())]
@@ -138,12 +139,12 @@ def compare(prior_bundle, candidate_bundle, automatic_additions=(), *, automatic
     def permitted(kind, condition, old, new):
         if old == prior.fallback:
             if kind == "domain" and candidate.exact.get(condition) == new:
-                if new.target == "🛡️ 默认代理" and new.provider in proxy:
+                if new.target == roles.get("proxy") and new.provider in proxy:
                     return True
-                if new.target in {"🎬 媒体", "🎮 游戏"} and new.provider in services:
+                if new.target in {roles.get("media"), roles.get("games")} and new.provider in services:
                     return any(root in services[new.provider] for root in domain_suffixes(condition))
             if (
-                kind in {"ipv4", "ipv6"} and new.provider == "domestic-ip" and new.target == "DIRECT"
+                kind in {"ipv4", "ipv6"} and new.provider == roles.get("domestic_ip") and new.target == "DIRECT"
                 and automatic.get("domestic_ip") and country
             ):
                 low, high = interval(condition)
@@ -152,7 +153,7 @@ def compare(prior_bundle, candidate_bundle, automatic_additions=(), *, automatic
                     return mainland(country, condition)
         if (
             automatic.get("proxy_removals") and kind == "domain" and new == candidate.fallback
-            and old.target == "🛡️ 默认代理" and prior.exact.get(condition) == old
+            and old.target == roles.get("proxy") and prior.exact.get(condition) == old
         ):
             return removed.get(old.provider) == {f"DOMAIN,{condition}"}
         return False

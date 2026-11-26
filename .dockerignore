@@ -2,6 +2,7 @@
 !Dockerfile
 !LICENSE
 !prm_release.py
+!configuration.py
 !rule_changes.py
 !verify_release.py
 !mihomo.py

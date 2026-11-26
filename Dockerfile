@@ -6,5 +6,5 @@ RUN apk add --no-cache ca-certificates curl git nginx python3 py3-yaml tzdata \
     && apk del .build-deps
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
-COPY --chmod=0644 LICENSE prm_release.py rule_changes.py verify_release.py mihomo.py schedule.py origin.py test_release.py nginx.conf public-paths.conf /app/
+COPY --chmod=0644 LICENSE prm_release.py configuration.py rule_changes.py verify_release.py mihomo.py schedule.py origin.py test_release.py nginx.conf public-paths.conf /app/
 CMD ["python3", "/app/schedule.py"]

@@ -9,10 +9,27 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from unittest.mock import patch
 
+import configuration
 import prm_release as release
 import rule_changes
-from schedule import due_slot, publish_slot
+from schedule import MARKER_ZONE, SLOT_FORMAT, due_slot, publish_slot
 import verify_release
+
+
+ROLES = {"proxy": "🛡️ 默认代理", "media": "🎬 媒体", "games": "🎮 游戏", "domestic_ip": "domestic-ip"}
+GEO = {
+    "GeoSite.dat": {"method": "github", "repository": "Loyalsoldier/v2ray-rules-dat", "branch": "release",
+                    "path": "geosite.dat", "license": None},
+    "GeoIP.dat": {"method": "github", "repository": "v2fly/geoip", "branch": "release",
+                  "path": "geoip.dat", "license": "CC BY-SA 4.0"},
+    **{name: {"method": "db-ip", "kind": kind, "license": "CC BY 4.0"} for name, kind in configuration.DB_IP.items()},
+}
+
+
+def geo_metadata():
+    return {name: release.geo_record(definition, "a" * 40 if name.endswith(".dat") else "2026-11")
+            for name, definition in GEO.items()}
+
 
 def bundle(**entries):
     return {
@@ -41,9 +58,26 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(release.transient_network_error(release.ReviewRequired()))
 
     def test_due_slot_uses_the_last_shanghai_calendar_trigger(self):
-        self.assertEqual(due_slot(datetime(2026, 11, 26, 21, 29, tzinfo=timezone.utc)), "2026-11-26T23:30")
-        self.assertEqual(due_slot(datetime(2026, 11, 26, 21, 30, tzinfo=timezone.utc)), "2026-11-27T05:30")
-        self.assertEqual(due_slot(datetime(2026, 11, 26, 6, 30, tzinfo=timezone.utc)), "2026-11-26T14:30")
+        env = {"PUBLISH_TIMEZONE": "Asia/Shanghai", "PUBLISH_CHECK_TIMES": "05:30,08:30,11:30,14:30,17:30,20:30,23:30"}
+        _, zone, slots = configuration.schedule_settings(env)
+        for hour, minute, expected in ((21, 29, "2026-11-26T23:30"), (21, 30, "2026-11-27T05:30"),
+                                       (6, 30, "2026-11-26T14:30")):
+            now = datetime(2026, 11, 26, hour, minute, tzinfo=timezone.utc)
+            self.assertEqual(due_slot(now, zone, slots).strftime(SLOT_FORMAT), expected)
+        with self.assertRaisesRegex(ValueError, "PUBLISH_CHECK_TIMES"):
+            configuration.schedule_settings(env | {"PUBLISH_CHECK_TIMES": "05:30,05:30"})
+        self.assertFalse(configuration.schedule_settings(env | {"PUBLISH_SCHEDULE_ENABLED": "0"})[0])
+
+    def test_changing_timezone_uses_the_same_marker_clock(self):
+        _, zone, slots = configuration.schedule_settings({
+            "PUBLISH_TIMEZONE": "America/New_York", "PUBLISH_CHECK_TIMES": "01:30,02:30",
+        })
+        early = due_slot(datetime(2026, 11, 1, 5, 31, tzinfo=timezone.utc), zone, slots)
+        late = due_slot(datetime(2026, 11, 1, 6, 31, tzinfo=timezone.utc), zone, slots)
+        self.assertEqual(early.astimezone(MARKER_ZONE).strftime(SLOT_FORMAT), "2026-11-01T13:30")
+        self.assertEqual(early.astimezone(timezone.utc), late.astimezone(timezone.utc))
+        spring = due_slot(datetime(2026, 3, 8, 8, 0, tzinfo=timezone.utc), zone, slots)
+        self.assertEqual(spring.strftime(SLOT_FORMAT), "2026-03-08T01:30")
 
 
 class RuleChangeTests(unittest.TestCase):
@@ -79,26 +113,26 @@ class RuleChangeTests(unittest.TestCase):
         self.assertEqual(result[0]["status"], "review")
 
     def test_openai_subdomains_require_suffix_coverage(self):
-        profile = bundle(
-            openai=[f"DOMAIN-SUFFIX,{suffix}" for suffix in verify_release.OPENAI_SUFFIXES],
-            domestic=[f"DOMAIN,{host}" for host in verify_release.DOMESTIC_ANCHORS],
-        )
+        guards = {"openai_suffixes": {"provider": "ai", "domains": ["ai.example"]},
+                  "domestic_anchors": {"provider": "local", "domains": ["local.example"]}}
+        profile = bundle(ai=["DOMAIN-SUFFIX,ai.example"], local=["DOMAIN,local.example"])
         providers = profile["rule-providers"]
-        verify_release.check_policy(providers, profile["rules"])
-        providers["openai"]["payload"][1] = "DOMAIN,openai.com"
-        with self.assertRaisesRegex(ValueError, r"suffix coverage lost: openai\.com"):
-            verify_release.check_policy(providers, profile["rules"])
+        verify_release.check_policy(providers, profile["rules"], guards)
+        providers["ai"]["payload"][0] = "DOMAIN,ai.example"
+        with self.assertRaisesRegex(ValueError, r"suffix coverage lost: ai\.example"):
+            verify_release.check_policy(providers, profile["rules"], guards)
 
     def test_automatic_policy_matches_only_confirmed_directions(self):
         old = bundle(ordinary=["DOMAIN,keep.example", "DOMAIN,old.example"],
                      media=["DOMAIN,keep.media.example"], protected=["DOMAIN,important.example"])
-        old["rules"] = ["RULE-SET,protected,AI", "RULE-SET,ordinary,🛡️ 默认代理",
-                        "RULE-SET,media,🎬 媒体", "MATCH,fallback"]
+        old["rules"] = ["RULE-SET,protected,AI", "RULE-SET,ordinary,Renamed proxy",
+                        "RULE-SET,media,Renamed media", "MATCH,fallback"]
         new = bundle(ordinary=["DOMAIN,keep.example", "DOMAIN,new.example"],
                      media=["DOMAIN,keep.media.example", "DOMAIN,new.media.example", "DOMAIN,shared.example"],
                      protected=["DOMAIN,important.example"])
         new["rules"] = old["rules"]
         result = rule_changes.compare(old, new, automatic={
+            "roles": ROLES | {"proxy": "Renamed proxy", "media": "Renamed media"},
             "proxy": ["ordinary"], "proxy_removals": True, "services": {"media": ["media.example"]},
         })
         self.assertEqual({item: row["status"] for row in result for item in row["samples"]}, {
@@ -115,7 +149,7 @@ class RuleChangeTests(unittest.TestCase):
             cn = address.version == 4 or int(address) % 4 < 2
             return ({"country": {"iso_code": "CN" if cn else "US"}}, 25 if address.version == 4 else 127)
         country = SimpleNamespace(get_with_prefix_len=lookup)
-        policy = {"domestic_ip": True}
+        policy = {"domestic_ip": True, "roles": ROLES}
         result = rule_changes.compare(old, new, automatic=policy, country=country)
         self.assertEqual({r["kind"]: r["status"] for r in result}, {"ipv4": "allowed", "ipv6": "review"})
         result = rule_changes.compare(old, new, automatic=policy | {
@@ -129,7 +163,7 @@ class RuleChangeTests(unittest.TestCase):
         new = bundle(ordinary=["DOMAIN,old.example", "DOMAIN,new.example"],
                      direct=["IP-CIDR,192.0.2.0/24,no-resolve"])
         new["rules"] = old["rules"]
-        result = rule_changes.compare(old, new, automatic={"proxy": ["ordinary"]})
+        result = rule_changes.compare(old, new, automatic={"roles": ROLES, "proxy": ["ordinary"]})
         self.assertEqual(result[0]["status"], "conditional")
         self.assertEqual(result[0]["samples"], ["new.example"])
 
@@ -146,6 +180,12 @@ class ReleaseTests(unittest.TestCase):
         self.rule = {"id": "ordinary", "name": "ordinary", "outputs": ["mihomo"], "sources": [
             {"url": "https://raw.githubusercontent.com/org/repo/" + "a" * 40 + "/ordinary.list"}
         ]}
+
+    def settings(self, policy=None, household=()):
+        return configuration.Configuration(
+            {"geo_sources": GEO, "automatic_updates": {"roles": ROLES}} | (policy or {}),
+            list(household), {"guards": {}}, {"sources.yaml": "snapshot"},
+        )
 
     def test_unapproved_prm_rule_changes_are_rejected(self):
         initial = {"clients": release.CLIENTS, "rules": [self.rule],
@@ -166,7 +206,7 @@ class ReleaseTests(unittest.TestCase):
                   "early_rules": [], "rules": ["RULE-SET,ordinary,PROXY", "MATCH,DIRECT"]}
         public = self.setup_release(old, "")
         manifest = {"version": old, "base": "", "files": sorted(p.name for p in public.iterdir()),
-                    "sources": {"origin": source}, "geo": {}}
+                    "sources": {"origin": source}, "geo": geo_metadata()}
         release.write_json(public.parent / "manifest.json", manifest)
         release.point("current", old)
         (release.STATE / "household-rules.yaml").write_text('["DOMAIN,local,DIRECT"]')
@@ -178,6 +218,7 @@ class ReleaseTests(unittest.TestCase):
                                                {"payload": ["DOMAIN,new.example"]}}}
         reviewed = {"base": old, "bundle": expected}
         config = {"version": 7}
+        settings = self.settings(policy, before["rules"][:1])
         with (
             patch.multiple(release, POLICY_DIR=release.STATE),
             patch.object(release, "update", return_value=({"origin": source}, config, 12)) as update,
@@ -188,15 +229,15 @@ class ReleaseTests(unittest.TestCase):
             patch.object(verify_release, "check_core"),
         ):
             with self.assertRaisesRegex(release.ReviewRequired, "different current batch"):
-                release.stage(policy, {}, reviewed | {"base": ""})
+                release.stage(settings, {}, reviewed | {"base": ""})
             update.assert_not_called()
             with self.assertRaisesRegex(release.ReviewRequired, "complete reviewed bundle"):
-                release.stage(policy, {}, reviewed)
+                release.stage(settings, {}, reviewed)
             self.assertEqual(list(release.RELEASES.iterdir()), [public.parent])
             fetch.return_value = b"payload: ['DOMAIN,new.example']"
             info = {}
-            staged = release.stage(policy, info, reviewed)
-            update.assert_called_with(policy, info, {"origin": source})
+            staged = release.stage(settings, info, reviewed)
+            update.assert_called_with(settings.policy, info, {"origin": source})
             self.assertEqual(release.current(), old)
             self.assertEqual((release.RELEASES / staged / "public/GeoIP.dat").read_bytes(),
                              (public / "GeoIP.dat").read_bytes())
@@ -204,7 +245,7 @@ class ReleaseTests(unittest.TestCase):
     def test_first_stage_requires_reviewed_coverage_and_automatic_publish_cannot_use_it(self):
         with patch.object(release, "update") as update:
             with self.assertRaisesRegex(release.ReviewRequired, "independent reviewed bundle"):
-                release.stage({}, {})
+                release.stage(self.settings(), {})
             with self.assertRaisesRegex(ValueError, "explicit promotion"):
                 release.run("publish", None, {}, {}, {"base": "", "bundle": {}})
             update.assert_not_called()
@@ -224,7 +265,7 @@ class ReleaseTests(unittest.TestCase):
             patch.object(release, "check_public") as check,
             patch.object(release, "stage") as stage,
         ):
-            self.assertEqual(release.run("publish", None, {}, report), "unchanged")
+            self.assertEqual(release.run("publish", None, self.settings(), report), "unchanged")
             check.assert_called_once_with(public)
             stage.assert_not_called()
             self.assertTrue(report["skipped_build"])
@@ -250,15 +291,15 @@ class ReleaseTests(unittest.TestCase):
         new = {"origin": ["org/repo", "b" * 40]}
         policy = {"providers": {name: ["origin", f"{name}.list", "classical"] for name in before["rule-providers"]},
                   "sources": {"origin": ["org/repo", "main"]}, "early_rules": [], "rules": rules[1:],
-                  "automatic_updates": {"proxy": ["ordinary"]}}
-        release.write_json(public.parent / "manifest.json", {"sources": prior, "geo": {},
+                  "automatic_updates": {"roles": ROLES, "proxy": ["ordinary"]}}
+        release.write_json(public.parent / "manifest.json", {"sources": prior, "geo": geo_metadata(),
             "rule_inputs": {item["id"]: item for item in release.desired_rules(policy, prior)}})
         (release.STATE / "household-rules.yaml").write_text(yaml.safe_dump(rules[:1]))
         config = {"config": {"rules": release.desired_rules(policy, new)}}
         def fetch(url):
             return (b"payload: ['DOMAIN,ordinary.example','DOMAIN,added.example']" if "ordinary.yaml" in url
                     else b"payload: ['DOMAIN,closed.example','DOMAIN,unknown.example']")
-        def geo(target, *args):
+        def geo(definitions, target, *args):
             for file in public.glob("*.dat"):
                 shutil.copyfile(file, target / file.name)
             return {}
@@ -272,7 +313,7 @@ class ReleaseTests(unittest.TestCase):
             patch.object(verify_release, "check_core"),
         ):
             report = {}
-            new_id = release.stage(policy, report)
+            new_id = release.stage(self.settings(policy, rules[:1]), report)
         result = release.RELEASES / new_id
         self.assertEqual(set(report["retained_providers"]), {"closed"})
         self.assertTrue(report["reviewed_out"])
@@ -287,11 +328,76 @@ class ReleaseTests(unittest.TestCase):
         operations = release.rule_updates([self.rule, self.rule | {"id": "retired"}], wanted)
         self.assertEqual([operation["op"] for operation in operations], ["remove_rule", "add_rule", "reorder_rules"])
 
-    def test_rollback_requires_all_three_replacement_ip_databases(self):
-        geo = {name: {"source": "DB-IP Lite"} for name in release.DB_IP}
-        self.assertFalse(release.eligible_geo({"geo": geo}))
-        geo["GeoIP.dat"] = {"source": release.GEO_IP_REPO}
+    def test_rollback_accepts_proven_legacy_sources_and_rejects_unverified_sources(self):
+        geo = {name: {key: value for key, value in record.items() if key != "definition"}
+               for name, record in geo_metadata().items()}
         self.assertTrue(release.eligible_geo({"geo": geo}))
+        geo["GeoIP.dat"]["source"] = "Loyalsoldier/geoip"
+        self.assertFalse(release.eligible_geo({"geo": geo}))
+
+    def test_source_change_requires_stage_before_any_upstream_read(self):
+        changed = GEO | {"GeoIP.dat": GEO["GeoIP.dat"] | {"branch": "another"}}
+        metadata = {"geo": geo_metadata()}
+        report = {}
+        with patch.object(release, "revision") as revision:
+            with self.assertRaisesRegex(release.ReviewRequired, "stage and promote"):
+                release.automatic_inputs(self.settings({"geo_sources": changed}), report, metadata)
+            revision.assert_not_called()
+        self.assertEqual(report["geo_source_changes"], ["GeoIP.dat"])
+
+    def test_same_source_fallback_is_never_used_for_a_new_branch(self):
+        prior = self.setup_release("20261126T000001000000Z", "")
+        metadata = geo_metadata()
+        target = release.STATE / "output"
+        target.mkdir()
+        wanted = {name: item["version"] for name, item in metadata.items()} | {"GeoIP.dat": "b" * 40}
+        with patch.object(release, "fetch_geo", side_effect=OSError("source unavailable")) as fetch:
+            failures = {}
+            output = release.collect_geo(GEO, target, prior, metadata, wanted, failures)
+            self.assertEqual(output["GeoIP.dat"]["version"], "a" * 40)
+            self.assertEqual((target / "GeoIP.dat").read_bytes(), (prior / "GeoIP.dat").read_bytes())
+            self.assertEqual(set(failures), {"GeoIP.dat"})
+            alternative = GEO | {"GeoIP.dat": GEO["GeoIP.dat"] | {"branch": "another"}}
+            with self.assertRaisesRegex(OSError, "source unavailable"):
+                release.collect_geo(alternative, target, prior, metadata, wanted)
+            self.assertEqual(fetch.call_count, 2)
+
+    def test_equal_geo_bytes_with_new_source_still_update_current_manifest(self):
+        old = "20261126T000001000000Z"
+        candidate = "20261126T000002000000Z"
+        self.setup_release(old, "")
+        current = self.setup_release(candidate, old)
+        manifest = current.parent / "manifest.json"
+        data = json.loads(manifest.read_bytes())
+        new_geo = GEO["GeoIP.dat"] | {"branch": "second"}
+        data["geo"]["GeoIP.dat"] = release.geo_record(new_geo, "a" * 40)
+        release.write_json(manifest, data)
+        release.point("current", old)
+        with patch.object(release, "check_public") as check:
+            self.assertEqual(release.publish(candidate, {}), "published")
+            check.assert_called_once_with(current)
+            self.assertEqual(release.current(), candidate)
+            self.assertEqual(release.run("rollback", old, self.settings(), {}), "rolled-back")
+            self.assertEqual(release.current(), old)
+
+    def test_manual_promotion_rejects_stale_config_and_base(self):
+        old = "20261126T000001000000Z"
+        candidate = "20261126T000002000000Z"
+        self.setup_release(old, "")
+        staged = self.setup_release(candidate, "")
+        release.point("current", old)
+        path = staged.parent / "manifest.json"
+        with self.assertRaisesRegex(RuntimeError, "Candidate configuration differs"):
+            release.run("promote", candidate, self.settings(), {})
+        manifest = json.loads(path.read_bytes()) | {"local_config": self.settings().versions}
+        release.write_json(path, manifest)
+        with patch.object(release, "local_config_versions", return_value={"sources.yaml": "changed"}):
+            with self.assertRaisesRegex(RuntimeError, "Local rule inputs changed"):
+                release.run("promote", candidate, self.settings(), {})
+        with patch.object(release, "local_config_versions", return_value=self.settings().versions):
+            with self.assertRaisesRegex(RuntimeError, "different current batch"):
+                release.run("promote", candidate, self.settings(), {})
+        self.assertEqual(release.current(), old)
 
     def setup_release(self, version, base):
         folder = release.RELEASES / version
@@ -301,7 +407,9 @@ class ReleaseTests(unittest.TestCase):
         for path in files:
             (public / path).write_text(path)
         (folder / "rules.yaml").write_text("same rules")
-        release.write_json(folder / "manifest.json", {"version": version, "base": base, "files": files})
+        release.write_json(folder / "manifest.json", {
+            "version": version, "base": base, "files": files, "geo": geo_metadata(),
+        })
         return public
 
     def test_unchanged_release_checks_actual_public_files(self):
@@ -312,7 +420,7 @@ class ReleaseTests(unittest.TestCase):
         release.point("current", old)
         with patch.object(release, "check_public", side_effect=RuntimeError("missing public file")) as check:
             with self.assertRaisesRegex(RuntimeError, "missing public file"):
-                release.publish(candidate)
+                release.publish(candidate, {})
             check.assert_called_once_with(public)
         self.assertEqual(release.current(), old)
 

@@ -1,0 +1,25 @@
+baseline:
+  home.example: [Domain, DIRECT]
+  ai.example: [RuleSet(ai-example), AI]
+
+converged:
+  local.example: [RuleSet(local-example), DIRECT]
+
+guards:
+  openai_suffixes: {provider: ai-example, domains: [ai.example]}
+  domestic_anchors: {provider: local-example, domains: [local.example]}
+  direct_ports: {provider: mixed-example}
+
+geo:
+  rules:
+    - 'GEOSITE,google,PROBE'
+    - 'GEOIP,CN,PROBE,no-resolve'
+    - 'IP-ASN,13335,PROBE,no-resolve'
+    - 'MATCH,PROBE'
+  probes:
+    www.google.com: [GeoSite(google), PROBE]
+    223.5.5.5: [GeoIP(cn), PROBE]
+    1.1.1.1: [IPASN(13335), PROBE]
+    '[2400:3200::1]': [GeoIP(cn), PROBE]
+    '[2606:4700:4700::1111]': [IPASN(13335), PROBE]
+    9.9.9.9: [Match, PROBE]

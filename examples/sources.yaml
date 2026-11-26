@@ -1,0 +1,37 @@
+# 应按实际部署调整。规则条目使用示例域名。
+sources:
+  example-rules: [example-owner/example-rules, main]
+
+providers:
+  ai-example:
+    sources: [{content: 'DOMAIN-SUFFIX,ai.example'}]
+  local-example:
+    sources: [{content: 'DOMAIN,local.example'}]
+  mixed-example:
+    sources: [{content: 'DOMAIN,mixed.example'}]
+  domestic-ip-example:
+    sources: [{content: 'IP-CIDR,192.0.2.0/24,no-resolve'}]
+  ordinary-example: [example-rules, rules/ordinary.list, domain]
+
+early_rules: []
+rules:
+  - 'RULE-SET,ai-example,AI'
+  - 'RULE-SET,local-example,DIRECT'
+  - 'RULE-SET,mixed-example,DIRECT'
+  - 'RULE-SET,domestic-ip-example,DIRECT,no-resolve'
+  - 'RULE-SET,ordinary-example,Proxy'
+  - 'MATCH,Fallback'
+
+automatic_updates:
+  roles:
+    proxy: Proxy
+    media: Media
+    games: Games
+    domestic_ip: domestic-ip-example
+  proxy: [ordinary-example]
+
+geo_sources:
+  GeoSite.dat: {method: github, repository: Loyalsoldier/v2ray-rules-dat, branch: release, path: geosite.dat, license: null}
+  GeoIP.dat: {method: github, repository: v2fly/geoip, branch: release, path: geoip.dat, license: CC BY-SA 4.0}
+  Country.mmdb: {method: db-ip, kind: country, license: CC BY 4.0}
+  ASN.mmdb: {method: db-ip, kind: asn, license: CC BY 4.0}

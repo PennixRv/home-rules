@@ -1,4 +1,4 @@
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from http.client import IncompleteRead
 import os
 from pathlib import Path
@@ -9,18 +9,23 @@ from threading import Event
 from urllib.error import URLError
 from zoneinfo import ZoneInfo
 
+from configuration import schedule_settings
 import prm_release
 
 
-SHANGHAI = ZoneInfo("Asia/Shanghai")
-CHECK_HOURS = range(5, 24, 3)
+MARKER_ZONE = ZoneInfo("Asia/Shanghai")
+SLOT_FORMAT = "%Y-%m-%dT%H:%M"
 
 
-def due_slot(now):
-    local = now.astimezone(SHANGHAI)
-    hour = next((hour for hour in reversed(CHECK_HOURS) if local.time() >= time(hour, 30)), None)
-    day = local.date() if hour is not None else local.date() - timedelta(days=1)
-    return f"{day}T{hour if hour is not None else CHECK_HOURS[-1]:02d}:30"
+def due_slot(now, zone, slots):
+    day = now.astimezone(zone).date()
+    for offset in range(3):
+        for slot in reversed(slots):
+            local = datetime.combine(day - timedelta(days=offset), slot, zone)
+            instant = local.astimezone(timezone.utc)
+            if instant <= now and instant.astimezone(zone).replace(tzinfo=None) == local.replace(tzinfo=None):
+                return local
+    raise ValueError("No scheduled slot in the last three local calendar days")
 
 
 def publish_slot(stop, slot):
@@ -46,7 +51,11 @@ def main():
     stop = Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    if os.environ.get("PUBLISH_SCHEDULE_ENABLED", "1") != "1":
+    try:
+        enabled, zone, slots = schedule_settings(os.environ)
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
+    if not enabled:
         print("Scheduled publication disabled", flush=True)
         stop.wait()
         return
@@ -59,12 +68,17 @@ def main():
         except (URLError, TimeoutError, ConnectionError, IncompleteRead, RuntimeError):
             stop.wait(5)
     while not stop.is_set():
-        slot = due_slot(datetime.now(timezone.utc))
-        if not marker.exists() or marker.read_text().strip() < slot:
-            print(f"Scheduled publication for {slot} Asia/Shanghai", flush=True)
-            publish_slot(stop, slot)
+        slot = due_slot(datetime.now(timezone.utc), zone, slots)
+        # Keep the on-disk marker in the previous release's fixed clock.
+        recorded = slot.astimezone(MARKER_ZONE).strftime(SLOT_FORMAT)
+        prior = marker.read_text().strip() if marker.exists() else ""
+        if prior:
+            datetime.strptime(prior, SLOT_FORMAT)
+        if prior < recorded:
+            print(f"Scheduled publication for {slot.strftime(SLOT_FORMAT)} {zone.key}", flush=True)
+            publish_slot(stop, slot.strftime(SLOT_FORMAT))
             pending = marker.with_suffix(".scheduled-slot.tmp")
-            pending.write_text(slot + "\n")
+            pending.write_text(recorded + "\n")
             pending.replace(marker)
         stop.wait(15)
 

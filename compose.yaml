@@ -25,6 +25,8 @@ services:
       RULES_STATE: /data/state
       RULES_ORIGIN_URL: ${RULES_ORIGIN_URL:-http://origin:8081/active}
       PUBLISH_SCHEDULE_ENABLED: ${PUBLISH_SCHEDULE_ENABLED:-1}
+      PUBLISH_TIMEZONE: ${PUBLISH_TIMEZONE:?required}
+      PUBLISH_CHECK_TIMES: ${PUBLISH_CHECK_TIMES:?required}
     volumes:
       - ${HOME_RULES_CONFIG:?required}:/data/config:ro
       - ${HOME_RULES_STATE:?required}:/data/state
